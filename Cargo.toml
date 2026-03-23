@@ -1,0 +1,27 @@
+[package]
+name = "rust_autotune"
+version = "0.1.0"
+edition = "2021"
+description = "Real-time pitch correction CLI in Rust"
+license = "MIT"
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[[bin]]
+name = "rust_autotune_cli"
+path = "src/main.rs"
+
+[features]
+default = []
+plugin = ["dep:nih_plug"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+cpal = "0.15"
+ctrlc = "3.4"
+dasp = { version = "0.11", features = ["interpolate", "interpolate-linear"] }
+rtrb = "0.3"
+rustfft = "6.2"
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", optional = true }
