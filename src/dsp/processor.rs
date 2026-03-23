@@ -98,7 +98,7 @@ impl PitchCorrectionProcessor {
 
         let process_max_block = 2048;
         let hop_size = shifter_cfg.frame_size / shifter_cfg.overlap;
-        let pitch_smoothing_coeff = one_pole_coeff_ms(35.0, config.sample_rate, hop_size);
+        let pitch_smoothing_coeff = one_pole_coeff_ms(10.0, config.sample_rate, hop_size);
         let shifter = PsolaShifter::new(config.sample_rate, shifter_cfg);
         let dry_latency = shifter.latency_samples();
         let dry_delay_len = (dry_latency + 1).max(1);
@@ -141,7 +141,7 @@ impl PitchCorrectionProcessor {
                 ratio: 1.0,
             },
             last_ratio: 1.0,
-            ratio_slew_cents_per_sec: 2800.0,
+            ratio_slew_cents_per_sec: 6000.0,
             process_max_block,
         }
     }
@@ -192,18 +192,7 @@ impl PitchCorrectionProcessor {
         let ratio_limited = self.limit_ratio_step(ratio_smoothed, input.len()).clamp(0.5, 2.0);
 
         // Dodatkowe gladzenie w ramach bloku redukuje skokowe zmiany pitch ratio.
-        let ratio_for_block = if input.len() > 1 {
-            let interp = Linear::new([self.last_ratio], [ratio_limited]);
-            let mut acc = 0.0;
-            for i in 0..input.len() {
-                let x = i as f64 / (input.len() - 1) as f64;
-                acc += interp.interpolate(x)[0];
-            }
-            acc / input.len() as f32
-        } else {
-            ratio_limited
-        }
-        .clamp(0.5, 2.0);
+        let ratio_for_block = ratio_limited.clamp(0.5, 2.0);
 
         self.last_ratio = ratio_limited;
         self.meter.ratio = ratio_for_block;
@@ -302,7 +291,12 @@ impl PitchCorrectionProcessor {
         let distance_weight = (cents_error / 80.0).clamp(0.0, 1.0);
         let style_weight =
             self.aggressiveness + (1.0 - self.aggressiveness) * distance_weight;
-        let effective_strength = (self.correction_strength * style_weight).clamp(0.0, 1.0);
+        
+        let max_correction = 0.7;
+
+        let effective_strength =
+            (self.correction_strength * style_weight * max_correction)
+                .clamp(0.0, max_correction);
 
         (1.0 + (raw_ratio - 1.0) * effective_strength).clamp(0.5, 2.0)
     }
