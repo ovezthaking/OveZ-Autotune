@@ -2,6 +2,8 @@
 
 Profesjonalny, niskolatencyjny pitch-correction w Rust, z naciskiem na jakosc i bezpieczenstwo real-time.
 
+Critical bug: Problem z korygowaniem nut - Jednonutowy, robotyczny dźwięk przy jakimkolwiek ustawieniu. Podejrzewam, że problem leży w implementacji PSOLA, gdzie pitch marks mogą być źle rozmieszczone lub synchronizacja OLA jest niewłaściwa. Wymaga to dokładnego debugowania i testowania z różnymi sygnałami wejściowymi.
+
 ## Cechy
 
 - Audio I/O przez `cpal` (wejscie i wyjscie na zywo)
