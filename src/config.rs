@@ -30,6 +30,9 @@ pub struct RuntimeConfig {
     pub retune_time_ms: f32,
     pub correction_strength: f32,
     pub aggressiveness: f32,
+    /// Martwa strefa w centach — odchylenia mniejsze niż ta wartość nie są korygowane.
+    /// 0 = hard-tune (zawsze koryguj), 20-30 = naturalne brzmienie.
+    pub dead_zone_cents: f32,
     pub scale: ScaleArg,
     pub root_note: String,
     pub dry_level: f32,

@@ -27,11 +27,15 @@ struct Cli {
     #[arg(long, default_value_t = 40.0)]
     retune_ms: f32,
 
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, default_value_t = 1.0)]
     strength: f32,
 
     #[arg(long, default_value_t = 0.7)]
     aggressiveness: f32,
+
+    /// Martwa strefa w centach. 0 = hard-tune, 20-30 = naturalne brzmienie.
+    #[arg(long, default_value_t = 25.0)]
+    dead_zone: f32,
 
     #[arg(long, value_enum, default_value_t = ScaleArg::Chromatic)]
     scale: ScaleArg,
@@ -68,6 +72,7 @@ fn main() -> Result<()> {
         retune_time_ms: cli.retune_ms,
         correction_strength: cli.strength.clamp(0.0, 1.0),
         aggressiveness: cli.aggressiveness.clamp(0.0, 1.0),
+        dead_zone_cents: cli.dead_zone.clamp(0.0, 50.0),
         scale: cli.scale,
         root_note: cli.root,
         dry_level: (cli.dry / 100.0).clamp(0.0, 1.0),

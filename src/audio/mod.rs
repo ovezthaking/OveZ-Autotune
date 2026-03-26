@@ -85,6 +85,7 @@ pub fn run_realtime(config: RuntimeConfig) -> Result<()> {
         force_midi_note: config.force_midi_note,
         formant_enabled: config.formant_enabled,
         formant_amount: config.formant_amount,
+        dead_zone_cents: config.dead_zone_cents,
     };
 
     let underruns_out = underruns.clone();

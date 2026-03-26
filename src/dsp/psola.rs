@@ -142,7 +142,10 @@ impl PsolaShifter {
                 self.psola_frame.copy_from_slice(&self.in_fifo);
             }
         } else {
-            self.psola_frame.fill(0.0);
+            // Unvoiced (spółgłoski, przejścia, cisza): PSOLA nie ma sensu bez okresu.
+            // Passthrough zamiast zer — eliminuje "połykanie" sylab i stłumienie.
+            // voiced_mix crossfade poniżej zapewnia płynne przejście.
+            self.psola_frame.copy_from_slice(&self.in_fifo);
         }
 
         // Crossfade voiced/unvoiced miedzy frame'ami.
@@ -157,9 +160,18 @@ impl PsolaShifter {
     }
 
     fn detect_pitch_marks(&mut self, period_a: usize) -> usize {
+        // Pitch marki wyznaczamy przez lokalną autokorelację zamiast peak amplitudy.
+        // Peak amplitudy działa źle dla wokalu — maksimum amplitudy nie pokrywa się
+        // ze spójnością fazy między okresami, przez co PSOLA "skleja" niekompatybilne
+        // fragmenty i powstaje efekt "jedna nuta" lub "metaliczny buzz".
+        //
+        // Zamiast tego: dla każdej kandydackiej pozycji marki liczymy korelację
+        // między oknem wokół tej pozycji a oknem przesuniętym o period_a.
+        // Wybieramy pozycję z najwyższą korelacją — to właśnie punkt spójności fazy.
         let search_radius = (period_a / 3).max(2);
+        let corr_window = (period_a / 2).max(4);
         let min_pos = period_a;
-        let max_pos = self.frame_size.saturating_sub(period_a + 1);
+        let max_pos = self.frame_size.saturating_sub(period_a + corr_window + 1);
 
         if max_pos <= min_pos {
             return 0;
@@ -168,7 +180,7 @@ impl PsolaShifter {
         let center = self.frame_size / 2;
         let anchor_lo = center.saturating_sub(period_a).max(min_pos);
         let anchor_hi = (center + period_a).min(max_pos);
-        let anchor = find_peak_abs(&self.in_fifo, anchor_lo, anchor_hi);
+        let anchor = find_best_corr_mark(&self.in_fifo, anchor_lo, anchor_hi, period_a, corr_window);
 
         let mut tmp_count = 0usize;
         self.analysis_marks[tmp_count] = anchor;
@@ -179,7 +191,7 @@ impl PsolaShifter {
             expected = expected.saturating_sub(period_a);
             let lo = expected.saturating_sub(search_radius).max(min_pos);
             let hi = (expected + search_radius).min(max_pos);
-            let peak = find_peak_abs(&self.in_fifo, lo, hi);
+            let peak = find_best_corr_mark(&self.in_fifo, lo, hi, period_a, corr_window);
             self.analysis_marks[tmp_count] = peak;
             tmp_count += 1;
         }
@@ -189,7 +201,7 @@ impl PsolaShifter {
             expected = expected.saturating_add(period_a);
             let lo = expected.saturating_sub(search_radius).max(min_pos);
             let hi = (expected + search_radius).min(max_pos);
-            let peak = find_peak_abs(&self.in_fifo, lo, hi);
+            let peak = find_best_corr_mark(&self.in_fifo, lo, hi, period_a, corr_window);
             self.analysis_marks[tmp_count] = peak;
             tmp_count += 1;
         }
@@ -303,19 +315,41 @@ impl PsolaShifter {
     }
 }
 
-fn find_peak_abs(x: &[f32], start: usize, end: usize) -> usize {
-    let mut idx = start;
-    let mut max_v = x[start].abs();
-    let mut i = start + 1;
-    while i <= end {
-        let v = x[i].abs();
-        if v > max_v {
-            max_v = v;
-            idx = i;
+/// Dla zakresu kandydackich pozycji marki [start..=end] wybiera tę,
+/// dla której korelacja sygnału w oknie wokół marki z sygnałem przesuniętym
+/// o `period` próbek jest największa. To zapewnia spójność fazy między
+/// kolejnymi okresami — fundament poprawnego działania PSOLA.
+fn find_best_corr_mark(x: &[f32], start: usize, end: usize, period: usize, window: usize) -> usize {
+    let mut best_idx = start;
+    let mut best_corr = f32::NEG_INFINITY;
+
+    for pos in start..=end {
+        let lo = pos;
+        let hi = (pos + window).min(x.len().saturating_sub(period + 1));
+        if hi <= lo {
+            continue;
         }
-        i += 1;
+
+        let mut corr = 0.0f32;
+        let mut norm_a = 0.0f32;
+        let mut norm_b = 0.0f32;
+        for i in lo..hi {
+            let a = x[i];
+            let b = x[i + period];
+            corr += a * b;
+            norm_a += a * a;
+            norm_b += b * b;
+        }
+        let denom = (norm_a * norm_b).sqrt();
+        let normalized = if denom > 1.0e-9 { corr / denom } else { -1.0 };
+
+        if normalized > best_corr {
+            best_corr = normalized;
+            best_idx = pos;
+        }
     }
-    idx
+
+    best_idx
 }
 
 fn zero_crossing_rate(x: &[f32]) -> f32 {

@@ -16,6 +16,7 @@ pub struct ProcessorConfig {
     pub retune_time_ms: f32,
     pub correction_strength: f32,
     pub aggressiveness: f32,
+    pub dead_zone_cents: f32,
     pub dry_level: f32,
     pub wet_level: f32,
     pub force_midi_note: Option<u8>,
@@ -51,6 +52,7 @@ pub struct PitchCorrectionProcessor {
     max_unreliable_hold_blocks: usize,
     correction_strength: f32,
     aggressiveness: f32,
+    dead_zone_cents: f32,
     dry_level: f32,
     wet_level: f32,
     force_midi_note: Option<u8>,
@@ -122,6 +124,7 @@ impl PitchCorrectionProcessor {
             max_unreliable_hold_blocks: 14,
             correction_strength: config.correction_strength.clamp(0.0, 1.0),
             aggressiveness: config.aggressiveness.clamp(0.0, 1.0),
+            dead_zone_cents: config.dead_zone_cents.clamp(0.0, 50.0),
             dry_level: config.dry_level.clamp(0.0, 1.0),
             wet_level: config.wet_level.clamp(0.0, 1.0),
             force_midi_note: config.force_midi_note,
@@ -158,6 +161,10 @@ impl PitchCorrectionProcessor {
 
     pub fn set_aggressiveness(&mut self, aggressiveness: f32) {
         self.aggressiveness = aggressiveness.clamp(0.0, 1.0);
+    }
+
+    pub fn set_dead_zone_cents(&mut self, cents: f32) {
+        self.dead_zone_cents = cents.clamp(0.0, 50.0);
     }
 
     pub fn set_scale_key(&mut self, kind: ScaleKind, root_pc: i32) {
@@ -277,23 +284,23 @@ impl PitchCorrectionProcessor {
         self.meter.target_hz = target_hz;
         let raw_ratio = (target_hz / tracked_pitch_hz).clamp(0.5, 2.0);
 
-        // Korekcja jest 2-etapowa:
-        // 1) SNAP: target_hz to najblizsza nuta z wybranej skali.
-        // 2) STRENGTH/AGGRESSIVENESS: kontrolujemy jak mocno i jak "twardo"
-        //    glos ma byc dociagany do tej nuty.
-        //
-        // Dla niskiej aggressiveness korekcja jest lagodna przy malych odstrojeniach,
-        // a dla wysokiej aggressiveness utrzymuje silny snap nawet blisko celu,
-        // dajac klasyczny hard-tune character.
         let cents_error = 1200.0 * raw_ratio.log2().abs();
-        let distance_weight = (cents_error / 80.0).clamp(0.0, 1.0);
-        let style_weight =
-            self.aggressiveness + (1.0 - self.aggressiveness) * distance_weight;
 
-        // FIX: Usunięto hardcoded max_correction = 0.7, który blokował pełną korekcję
-        // nawet przy strength=1.0 i aggressiveness=1.0. correction_strength jest już
-        // ograniczony do [0.0, 1.0] przy ustawianiu, więc dodatkowy cap był zbędny.
-        let effective_strength = (self.correction_strength * style_weight).clamp(0.0, 1.0);
+        // Dead zone: jeśli wokalista śpiewa wystarczająco blisko nuty, nie ruszamy pitch.
+        // Bez tego autotune koryguje każde minimalne odchylenie — daje efekt "robot on a grid".
+        // Typowe wartości: 20-30 centów dla naturalnego brzmienia, 0 dla hard-tune.
+        if cents_error < self.dead_zone_cents {
+            return 1.0;
+        }
+
+        // Płynne wejście w korekcję powyżej dead zone — unikamy twardego skoku przy granicy.
+        // Ramp od dead_zone do dead_zone+20ct sprawia, że korekcja narasta stopniowo.
+        let ramp_width = 20.0_f32;
+        let ramp_factor = ((cents_error - self.dead_zone_cents) / ramp_width).clamp(0.0, 1.0);
+
+        let distance_weight = (cents_error / 80.0).clamp(0.0, 1.0);
+        let style_weight = self.aggressiveness + (1.0 - self.aggressiveness) * distance_weight;
+        let effective_strength = (self.correction_strength * style_weight * ramp_factor).clamp(0.0, 1.0);
 
         (1.0 + (raw_ratio - 1.0) * effective_strength).clamp(0.5, 2.0)
     }

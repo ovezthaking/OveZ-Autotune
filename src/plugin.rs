@@ -78,6 +78,9 @@ pub struct RustAutotuneParams {
     #[id = "aggr"]
     pub aggressiveness: FloatParam,
 
+    #[id = "dead_zone"]
+    pub dead_zone: FloatParam,
+
     #[id = "scale"]
     pub scale: EnumParam<ScaleParam>,
 
@@ -113,6 +116,12 @@ impl Default for RustAutotuneParams {
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )
                 .with_unit(""),
+            dead_zone: FloatParam::new(
+                "Dead Zone",
+                25.0,
+                FloatRange::Linear { min: 0.0, max: 50.0 },
+            )
+                .with_unit(" ct"),
             scale: EnumParam::new("Scale", ScaleParam::Chromatic),
             key: EnumParam::new("Key", KeyParam::C),
         }
@@ -190,6 +199,7 @@ impl Plugin for RustAutotunePlugin {
             retune_time_ms: 35.0,
             correction_strength: 1.0,
             aggressiveness: 0.8,
+            dead_zone_cents: 25.0,
             // FIX: Procesor inicjalizowany z dry=0/wet=1 jako punkt startowy;
             // rzeczywiste wartości są ustawiane w process() z params przed każdym blokiem.
             dry_level: 0.0,
@@ -235,6 +245,7 @@ impl Plugin for RustAutotunePlugin {
         processor.set_retune_time_ms(retune_ms);
         processor.set_correction_strength(strength);
         processor.set_aggressiveness(aggressiveness);
+        processor.set_dead_zone_cents(self.params.dead_zone.value());
         processor.set_scale_key(scale.into(), key.pitch_class());
         processor.set_dry_wet_levels(dry, wet);
 
