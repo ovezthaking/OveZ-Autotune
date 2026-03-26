@@ -1,10 +1,7 @@
 use crate::dsp::formant::FormantCorrector;
 use crate::dsp::psola::{PsolaConfig, PsolaShifter};
 use crate::dsp::scale::{midi_to_hz, ScaleKind, ScaleMapper};
-use crate::dsp::smoothing::OnePoleSmoother;
 use crate::dsp::yin::{PitchEstimate, YinDetector};
-use dasp::interpolate::linear::Linear;
-use dasp::interpolate::Interpolator;
 
 #[derive(Debug, Clone)]
 pub struct ProcessorConfig {
@@ -35,7 +32,6 @@ pub struct MeterSnapshot {
 pub struct PitchCorrectionProcessor {
     yin: YinDetector,
     mapper: ScaleMapper,
-    smoother: OnePoleSmoother,
     shifter: PsolaShifter,
     formant: FormantCorrector,
 
@@ -43,13 +39,6 @@ pub struct PitchCorrectionProcessor {
     min_freq_hz: f32,
     max_freq_hz: f32,
     sample_rate: f32,
-    hop_size: usize,
-    retune_time_ms: f32,
-    pitch_smoothing_coeff: f32,
-    smoothed_pitch_hz: f32,
-    last_reliable_pitch_hz: f32,
-    unreliable_blocks: usize,
-    max_unreliable_hold_blocks: usize,
     correction_strength: f32,
     aggressiveness: f32,
     dead_zone_cents: f32,
@@ -57,10 +46,34 @@ pub struct PitchCorrectionProcessor {
     wet_level: f32,
     force_midi_note: Option<u8>,
 
+    // Pitch tracking
+    smoothed_pitch_hz: f32,
+    pitch_lp_coeff: f32,
+    last_reliable_pitch_hz: f32,
+    unreliable_blocks: usize,
+    max_unreliable_hold_blocks: usize,
+
+    // Ratio: jeden LP filtr sterowany przez retune_time_ms.
+    // Poprzednia architektura miała trzy smoothery w szeregu:
+    //   pitch LP (10ms) -> OnePoleSmoother (retune_ms) -> limit_ratio_step (slew)
+    // Trzy filtry w szeregu = overdamped response. Ratio nigdy nie docierało do celu
+    // i oscylowało wokół wartości pośredniej — stąd "jedna nuta" i efekt modulatora.
+    current_ratio: f32,
+    ratio_lp_coeff: f32,
+    retune_time_ms: f32,
+
+    // Analiza pitch: ring buffer + linearyzacja do scratch co hop_size próbek.
+    // Poprzedni kod używał analysis_ready=true dopiero po zapełnieniu całego ringu (2048
+    // próbek, ~46ms). Przez ten czas PSOLA pracował z ratio=1.0, potem ratio nagle skakało.
+    // Teraz ring jest wypełniany inkrementalnie, YIN odpytywany co hop_size próbek
+    // synchronicznie z krokiem PSOLA. Brak zimnego startu, brak skoku ratio na początku.
     analysis_ring: Vec<f32>,
-    analysis_idx: usize,
+    analysis_ring_len: usize,
+    analysis_write: usize,
     analysis_scratch: Vec<f32>,
-    analysis_ready: bool,
+    analysis_hop: usize,
+    analysis_hop_counter: usize,
+    analysis_filled: usize,
 
     temp_a: Vec<f32>,
     temp_b: Vec<f32>,
@@ -70,18 +83,22 @@ pub struct PitchCorrectionProcessor {
     dry_delay_idx: usize,
 
     meter: MeterSnapshot,
-    last_ratio: f32,
-    ratio_slew_cents_per_sec: f32,
     process_max_block: usize,
 }
 
 impl PitchCorrectionProcessor {
     pub fn new(config: ProcessorConfig, mapper: ScaleMapper) -> Self {
         let analysis_frame_size = 2048;
+
+        // frame_size=2048 (~46ms @ 44100): wystarczy na pełny okres dla 80Hz (551 próbek).
+        // Poprzednie frame_size=1024 było za krótkie — grains nie pokrywały pełnego okresu
+        // dla niskich głosów, stąd artefakty fazowe i "metaliczne pudełko".
+        // overlap=8 -> step_size=256. Przy frame 2048 OLA jest gładkie nawet przy ratio 1.5+.
         let shifter_cfg = PsolaConfig {
-            frame_size: 1024,
-            overlap: 4,
+            frame_size: 2048,
+            overlap: 8,
         };
+        let hop_size = shifter_cfg.frame_size / shifter_cfg.overlap; // 256
 
         let yin = YinDetector::new(
             config.sample_rate,
@@ -91,47 +108,48 @@ impl PitchCorrectionProcessor {
             config.yin_threshold,
         );
 
-        let smoother = OnePoleSmoother::new(
-            1.0,
-            config.retune_time_ms,
-            config.sample_rate,
-            shifter_cfg.frame_size / shifter_cfg.overlap,
-        );
-
-        let process_max_block = 2048;
-        let hop_size = shifter_cfg.frame_size / shifter_cfg.overlap;
-        let pitch_smoothing_coeff = one_pole_coeff_ms(10.0, config.sample_rate, hop_size);
         let shifter = PsolaShifter::new(config.sample_rate, shifter_cfg);
         let dry_latency = shifter.latency_samples();
         let dry_delay_len = (dry_latency + 1).max(1);
 
+        // Pitch LP 8ms: szybkie śledzenie bez jittera między ramkami YIN.
+        let pitch_lp_coeff = one_pole_coeff_ms(8.0, config.sample_rate, hop_size);
+        // Ratio LP: czas retune definiuje jak szybko PSOLA dochodzi do docelowego ratio.
+        let ratio_lp_coeff =
+            one_pole_coeff_ms(config.retune_time_ms.max(1.0), config.sample_rate, hop_size);
+
+        let process_max_block = 2048;
+
         Self {
             yin,
             mapper,
-            smoother,
             shifter,
             formant: FormantCorrector::new(config.formant_enabled, config.formant_amount),
             confidence_threshold: config.confidence_threshold.clamp(0.0, 1.0),
             min_freq_hz: config.min_freq_hz,
             max_freq_hz: config.max_freq_hz,
             sample_rate: config.sample_rate,
-            hop_size,
-            retune_time_ms: config.retune_time_ms.max(1.0),
-            pitch_smoothing_coeff,
-            smoothed_pitch_hz: 0.0,
-            last_reliable_pitch_hz: 0.0,
-            unreliable_blocks: 0,
-            max_unreliable_hold_blocks: 14,
             correction_strength: config.correction_strength.clamp(0.0, 1.0),
             aggressiveness: config.aggressiveness.clamp(0.0, 1.0),
             dead_zone_cents: config.dead_zone_cents.clamp(0.0, 50.0),
             dry_level: config.dry_level.clamp(0.0, 1.0),
             wet_level: config.wet_level.clamp(0.0, 1.0),
             force_midi_note: config.force_midi_note,
+            smoothed_pitch_hz: 0.0,
+            pitch_lp_coeff,
+            last_reliable_pitch_hz: 0.0,
+            unreliable_blocks: 0,
+            max_unreliable_hold_blocks: 8,
+            current_ratio: 1.0,
+            ratio_lp_coeff,
+            retune_time_ms: config.retune_time_ms.max(1.0),
             analysis_ring: vec![0.0; analysis_frame_size],
-            analysis_idx: 0,
+            analysis_ring_len: analysis_frame_size,
+            analysis_write: 0,
             analysis_scratch: vec![0.0; analysis_frame_size],
-            analysis_ready: false,
+            analysis_hop: hop_size,
+            analysis_hop_counter: 0,
+            analysis_filled: 0,
             temp_a: vec![0.0; process_max_block],
             temp_b: vec![0.0; process_max_block],
             temp_wet: vec![0.0; process_max_block],
@@ -143,16 +161,14 @@ impl PitchCorrectionProcessor {
                 target_hz: 0.0,
                 ratio: 1.0,
             },
-            last_ratio: 1.0,
-            ratio_slew_cents_per_sec: 6000.0,
             process_max_block,
         }
     }
 
     pub fn set_retune_time_ms(&mut self, time_ms: f32) {
         self.retune_time_ms = time_ms.max(1.0);
-        self.smoother
-            .set_time_ms(self.retune_time_ms, self.sample_rate, self.hop_size);
+        self.ratio_lp_coeff =
+            one_pole_coeff_ms(self.retune_time_ms, self.sample_rate, self.analysis_hop);
     }
 
     pub fn set_correction_strength(&mut self, strength: f32) {
@@ -178,7 +194,6 @@ impl PitchCorrectionProcessor {
 
     pub fn process_block(&mut self, input: &[f32], output: &mut [f32]) {
         debug_assert_eq!(input.len(), output.len());
-
         let mut offset = 0;
         while offset < input.len() {
             let n = (input.len() - offset).min(self.process_max_block);
@@ -192,22 +207,33 @@ impl PitchCorrectionProcessor {
     }
 
     fn process_chunk(&mut self, input: &[f32], output: &mut [f32]) {
-        self.push_analysis(input);
+        for &x in input {
+            // Wpisujemy do ring buffera i liczymy ile mamy próbek (do warmup).
+            self.analysis_ring[self.analysis_write] = x;
+            self.analysis_write = (self.analysis_write + 1) % self.analysis_ring_len;
+            if self.analysis_filled < self.analysis_ring_len {
+                self.analysis_filled += 1;
+            }
 
-        let ratio_target = self.target_ratio_from_detection();
-        let ratio_smoothed = self.smoother.process(ratio_target).clamp(0.5, 2.0);
-        let ratio_limited = self.limit_ratio_step(ratio_smoothed, input.len()).clamp(0.5, 2.0);
+            // Co hop_size próbek, gdy mamy pełne okno: linearyzuj ring i odpytaj YIN.
+            self.analysis_hop_counter += 1;
+            if self.analysis_hop_counter >= self.analysis_hop {
+                self.analysis_hop_counter = 0;
+                if self.analysis_filled >= self.analysis_ring_len {
+                    self.linearize_ring();
+                    self.tick_ratio();
+                }
+            }
+        }
 
-        let ratio_for_block = ratio_limited.clamp(0.5, 2.0);
-
-        self.last_ratio = ratio_limited;
-        self.meter.ratio = ratio_for_block;
+        let ratio = self.current_ratio;
+        self.meter.ratio = ratio;
         let detected_pitch_hz = self.meter.detected_hz;
 
         if self.formant.is_enabled() {
             self.formant.preprocess(input, &mut self.temp_a[..input.len()]);
             self.shifter.process_block(
-                ratio_for_block,
+                ratio,
                 detected_pitch_hz,
                 &self.temp_a[..input.len()],
                 &mut self.temp_b[..input.len()],
@@ -215,23 +241,19 @@ impl PitchCorrectionProcessor {
             self.formant.postprocess(
                 &self.temp_b[..input.len()],
                 &mut self.temp_wet[..input.len()],
-                ratio_for_block,
+                ratio,
             );
         } else {
             self.shifter.process_block(
-                ratio_for_block,
+                ratio,
                 detected_pitch_hz,
                 input,
                 &mut self.temp_wet[..input.len()],
             );
         }
 
-        let dry = self.dry_level;
-        let wet = self.wet_level;
-
-        // Equal-power blend ogranicza percepcyjne skoki glosnosci przy zmianie proporcji.
-        let dry_w = dry.sqrt();
-        let wet_w = wet.sqrt();
+        let dry_w = self.dry_level.sqrt();
+        let wet_w = self.wet_level.sqrt();
         let norm = (dry_w + wet_w).max(1.0);
         let delay_len = self.dry_delay_line.len();
 
@@ -242,83 +264,72 @@ impl PitchCorrectionProcessor {
             if self.dry_delay_idx >= delay_len {
                 self.dry_delay_idx = 0;
             }
-
             let y = (dry_w * dry_sample + wet_w * self.temp_wet[i]) / norm;
             output[i] = y.clamp(-1.0, 1.0);
         }
     }
 
-    fn push_analysis(&mut self, input: &[f32]) {
-        for x in input {
-            self.analysis_ring[self.analysis_idx] = *x;
-            self.analysis_idx += 1;
-            if self.analysis_idx >= self.analysis_ring.len() {
-                self.analysis_idx = 0;
-                self.analysis_ready = true;
-            }
-        }
+    /// Kopiuje ring buffer do liniowego scratcha dla YIN.
+    /// write pointer wskazuje na najstarszą próbkę — od niej zaczynamy.
+    fn linearize_ring(&mut self) {
+        let head = self.analysis_write;
+        let tail = self.analysis_ring_len - head;
+        self.analysis_scratch[..tail].copy_from_slice(&self.analysis_ring[head..]);
+        self.analysis_scratch[tail..].copy_from_slice(&self.analysis_ring[..head]);
     }
 
-    fn target_ratio_from_detection(&mut self) -> f32 {
-        if !self.analysis_ready {
-            return 1.0;
-        }
-
-        self.copy_latest_frame();
+    /// Wywoływane co hop_size próbek — synchronicznie z krokiem PSOLA.
+    fn tick_ratio(&mut self) {
         let estimate = self.yin.estimate(&self.analysis_scratch);
-        let tracked_pitch_hz = self.update_pitch_tracking(estimate);
+        let tracked_hz = self.update_pitch_tracking(estimate);
 
-        if tracked_pitch_hz <= 0.0 {
+        let ratio_target = if tracked_hz <= 0.0 {
             self.meter.target_hz = 0.0;
-            return 1.0;
-        }
+            1.0_f32
+        } else {
+            self.compute_target_ratio(tracked_hz)
+        };
 
+        // Jeden krok LP — zamiast triple-smoother chain.
+        self.current_ratio += (ratio_target - self.current_ratio) * (1.0 - self.ratio_lp_coeff);
+        self.current_ratio = self.current_ratio.clamp(0.5, 2.0);
+    }
+
+    fn compute_target_ratio(&mut self, tracked_hz: f32) -> f32 {
         let target_hz = if let Some(note) = self.force_midi_note {
             midi_to_hz(note as f32)
         } else {
             self.mapper
-                .map_hz_to_scale(tracked_pitch_hz)
-                .unwrap_or(tracked_pitch_hz)
+                .map_hz_to_scale(tracked_hz)
+                .unwrap_or(tracked_hz)
         };
 
         self.meter.target_hz = target_hz;
-        let raw_ratio = (target_hz / tracked_pitch_hz).clamp(0.5, 2.0);
-
+        let raw_ratio = (target_hz / tracked_hz).clamp(0.5, 2.0);
         let cents_error = 1200.0 * raw_ratio.log2().abs();
 
-        // Dead zone: jeśli wokalista śpiewa wystarczająco blisko nuty, nie ruszamy pitch.
-        // Bez tego autotune koryguje każde minimalne odchylenie — daje efekt "robot on a grid".
-        // Typowe wartości: 20-30 centów dla naturalnego brzmienia, 0 dla hard-tune.
         if cents_error < self.dead_zone_cents {
             return 1.0;
         }
 
-        // Płynne wejście w korekcję powyżej dead zone — unikamy twardego skoku przy granicy.
-        // Ramp od dead_zone do dead_zone+20ct sprawia, że korekcja narasta stopniowo.
         let ramp_width = 20.0_f32;
         let ramp_factor = ((cents_error - self.dead_zone_cents) / ramp_width).clamp(0.0, 1.0);
-
         let distance_weight = (cents_error / 80.0).clamp(0.0, 1.0);
         let style_weight = self.aggressiveness + (1.0 - self.aggressiveness) * distance_weight;
-        let effective_strength = (self.correction_strength * style_weight * ramp_factor).clamp(0.0, 1.0);
+        let effective_strength =
+            (self.correction_strength * style_weight * ramp_factor).clamp(0.0, 1.0);
 
         (1.0 + (raw_ratio - 1.0) * effective_strength).clamp(0.5, 2.0)
-    }
-
-    fn copy_latest_frame(&mut self) {
-        let n = self.analysis_ring.len();
-        let head = self.analysis_idx;
-        let first = n - head;
-        self.analysis_scratch[..first].copy_from_slice(&self.analysis_ring[head..]);
-        self.analysis_scratch[first..].copy_from_slice(&self.analysis_ring[..head]);
     }
 
     fn update_pitch_tracking(&mut self, estimate: Option<PitchEstimate>) -> f32 {
         if let Some(e) = estimate {
             self.meter.confidence = e.confidence;
 
-            let in_range = e.frequency_hz >= self.min_freq_hz && e.frequency_hz <= self.max_freq_hz;
-            let reliable = e.voiced && in_range && e.confidence >= self.confidence_threshold;
+            let in_range =
+                e.frequency_hz >= self.min_freq_hz && e.frequency_hz <= self.max_freq_hz;
+            let reliable =
+                e.voiced && in_range && e.confidence >= self.confidence_threshold;
 
             let chosen_pitch = if reliable {
                 self.unreliable_blocks = 0;
@@ -337,9 +348,11 @@ impl PitchCorrectionProcessor {
                 if self.smoothed_pitch_hz <= 0.0 {
                     self.smoothed_pitch_hz = chosen_pitch;
                 } else {
-                    self.smoothed_pitch_hz = self.pitch_smoothing_coeff * self.smoothed_pitch_hz
-                        + (1.0 - self.pitch_smoothing_coeff) * chosen_pitch;
+                    self.smoothed_pitch_hz = self.pitch_lp_coeff * self.smoothed_pitch_hz
+                        + (1.0 - self.pitch_lp_coeff) * chosen_pitch;
                 }
+            } else if self.unreliable_blocks > self.max_unreliable_hold_blocks {
+                self.smoothed_pitch_hz = 0.0;
             }
 
             self.meter.detected_hz = self.smoothed_pitch_hz;
@@ -347,24 +360,13 @@ impl PitchCorrectionProcessor {
             self.meter.detected_hz = 0.0;
             self.meter.confidence = 0.0;
             self.unreliable_blocks = self.unreliable_blocks.saturating_add(1);
-            if self.unreliable_blocks <= self.max_unreliable_hold_blocks {
-                self.smoothed_pitch_hz = self.last_reliable_pitch_hz;
-            } else {
+            if self.unreliable_blocks > self.max_unreliable_hold_blocks {
                 self.smoothed_pitch_hz = 0.0;
                 self.last_reliable_pitch_hz = 0.0;
             }
         }
 
         self.smoothed_pitch_hz
-    }
-
-    fn limit_ratio_step(&self, ratio_target: f32, block_len: usize) -> f32 {
-        let prev = self.last_ratio.max(1.0e-6);
-        let dt = block_len as f32 / self.sample_rate.max(1.0);
-        let max_cents = (self.ratio_slew_cents_per_sec * dt).max(1.0);
-        let up = 2.0_f32.powf(max_cents / 1200.0);
-        let down = 1.0 / up;
-        ratio_target.clamp(prev * down, prev * up)
     }
 }
 
