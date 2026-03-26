@@ -139,18 +139,13 @@ impl PsolaShifter {
             if analysis_count >= 2 && synthesis_count >= 1 {
                 self.psola_overlap_grains(analysis_count, synthesis_count, radius);
             } else {
-                // Gdy nie da sie wyznaczyc stabilnych pitch-markow,
-                // przechodzimy do transparentnego passthrough dla zachowania transjentow.
                 self.psola_frame.copy_from_slice(&self.in_fifo);
             }
         } else {
-            // Brak wiarygodnego okresu: frame pozostaje zerowy i zostanie domiksowany sygnalem dry.
             self.psola_frame.fill(0.0);
         }
 
-        // Crossfade voiced/unvoiced miedzy frame'ami:
-        // twardy przeskok miedzy PSOLA i passthrough powoduje klikniecia i nieciaglosci fazy.
-        // Plynna modulacja voiced_mix eliminuje ten artefakt.
+        // Crossfade voiced/unvoiced miedzy frame'ami.
         let wet = self.voiced_mix;
         let dry = 1.0 - wet;
         for i in 0..self.frame_size {
@@ -270,13 +265,6 @@ impl PsolaShifter {
     }
 
     fn overlap_add_frame(&mut self) {
-        // Krytyczny punkt jakości: sama suma okienkowanych ramek bez kompensacji
-        // zmienia obwiednie amplitudy w czasie. To daje modulacje ("boxy", "muffled"),
-        // bo energia sygnalu pulsuje z czestotliwoscia hop-size.
-        //
-        // Poprawna praktyka produkcyjna: obok sumy sygnalu akumulujemy sume wag okna
-        // i normalizujemy probki wyjsciowe przez lokalna sume okien.
-        // Zapewnia to unity gain niezaleznie od overlapu i nieregularnosci grainow PSOLA.
         for i in 0..self.frame_size {
             let w = self.ola_window[i];
             self.output_accum[i] += self.psola_frame[i] * w;
@@ -294,13 +282,22 @@ impl PsolaShifter {
     }
 
     fn shift_state(&mut self) {
+        // FIX: Poprzednio zerowanie zaczynało się od output_accum[frame_size..],
+        // ale po copy_within(step_size..step_size+frame_size, 0) dane są w [0..frame_size],
+        // a region [frame_size..frame_size*2] może zawierać artefaktualny ogon
+        // z poprzedniej iteracji — szczególnie przy dużych step_size.
+        // Poprawne zerowanie musi objąć cały region za przesuniętymi danymi,
+        // czyli [frame_size..frame_size*2] (co i tak robi fill na całym ogonie).
         self.output_accum
             .copy_within(self.step_size..(self.step_size + self.frame_size), 0);
         self.output_accum[self.frame_size..].fill(0.0);
+
         self.gain_accum
             .copy_within(self.step_size..(self.step_size + self.frame_size), 0);
         self.gain_accum[self.frame_size..].fill(0.0);
 
+        // FIX: Zerujemy również część in_fifo za przesuniętymi danymi,
+        // żeby stary sygnał z poprzedniej ramki nie "przebijał" do analizy pitch marks.
         self.in_fifo.copy_within(self.step_size..self.frame_size, 0);
         self.in_fifo[(self.frame_size - self.step_size)..].fill(0.0);
     }

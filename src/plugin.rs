@@ -190,6 +190,8 @@ impl Plugin for RustAutotunePlugin {
             retune_time_ms: 35.0,
             correction_strength: 1.0,
             aggressiveness: 0.8,
+            // FIX: Procesor inicjalizowany z dry=0/wet=1 jako punkt startowy;
+            // rzeczywiste wartości są ustawiane w process() z params przed każdym blokiem.
             dry_level: 0.0,
             wet_level: 1.0,
             force_midi_note: None,
@@ -223,11 +225,18 @@ impl Plugin for RustAutotunePlugin {
         let scale = self.params.scale.value();
         let key = self.params.key.value();
 
+        // FIX: Odczytujemy bieżące wartości dry/wet z parametrów UI i przekazujemy
+        // do procesora. Poprzednio set_dry_wet_levels(0.0, 1.0) było hardcoded,
+        // przez co gałki Dry/Wet w pluginie nie miały żadnego efektu na wyjście
+        // z PitchCorrectionProcessor (dry delay line istniała, ale nigdy nie była używana).
+        let dry = (self.params.dry.value() / 100.0).clamp(0.0, 1.0);
+        let wet = (self.params.wet.value() / 100.0).clamp(0.0, 1.0);
+
         processor.set_retune_time_ms(retune_ms);
         processor.set_correction_strength(strength);
         processor.set_aggressiveness(aggressiveness);
         processor.set_scale_key(scale.into(), key.pitch_class());
-        processor.set_dry_wet_levels(0.0, 1.0);
+        processor.set_dry_wet_levels(dry, wet);
 
         let samples = buffer.samples();
         if samples == 0 {
@@ -250,13 +259,13 @@ impl Plugin for RustAutotunePlugin {
 
         processor.process_block(&self.input_mono[..samples], &mut self.output_mono[..samples]);
 
+        // FIX: Blending dry/wet jest teraz obsługiwany wyłącznie przez PitchCorrectionProcessor
+        // (z prawidłowym dry delay line wyrównującym latencję PSOLA). Tutaj przepisujemy
+        // gotowy sygnał do wszystkich kanałów wyjściowych bez dodatkowego miksowania.
         for (i, channel_samples) in buffer.iter_samples().enumerate() {
-            let dry = (self.params.dry.smoothed.next() / 100.0).clamp(0.0, 1.0);
-            let wet = (self.params.wet.smoothed.next() / 100.0).clamp(0.0, 1.0);
             let tuned = self.output_mono[i];
-
             for sample in channel_samples {
-                *sample = (*sample * dry + tuned * wet).clamp(-1.0, 1.0);
+                *sample = tuned;
             }
         }
 

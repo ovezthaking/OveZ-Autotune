@@ -191,7 +191,6 @@ impl PitchCorrectionProcessor {
         let ratio_smoothed = self.smoother.process(ratio_target).clamp(0.5, 2.0);
         let ratio_limited = self.limit_ratio_step(ratio_smoothed, input.len()).clamp(0.5, 2.0);
 
-        // Dodatkowe gladzenie w ramach bloku redukuje skokowe zmiany pitch ratio.
         let ratio_for_block = ratio_limited.clamp(0.5, 2.0);
 
         self.last_ratio = ratio_limited;
@@ -224,7 +223,6 @@ impl PitchCorrectionProcessor {
         let wet = self.wet_level;
 
         // Equal-power blend ogranicza percepcyjne skoki glosnosci przy zmianie proporcji.
-        // Dodatkowo normalizacja po sumie wag stabilizuje poziom dla niezaleznych dry/wet.
         let dry_w = dry.sqrt();
         let wet_w = wet.sqrt();
         let norm = (dry_w + wet_w).max(1.0);
@@ -291,12 +289,11 @@ impl PitchCorrectionProcessor {
         let distance_weight = (cents_error / 80.0).clamp(0.0, 1.0);
         let style_weight =
             self.aggressiveness + (1.0 - self.aggressiveness) * distance_weight;
-        
-        let max_correction = 0.7;
 
-        let effective_strength =
-            (self.correction_strength * style_weight * max_correction)
-                .clamp(0.0, max_correction);
+        // FIX: Usunięto hardcoded max_correction = 0.7, który blokował pełną korekcję
+        // nawet przy strength=1.0 i aggressiveness=1.0. correction_strength jest już
+        // ograniczony do [0.0, 1.0] przy ustawianiu, więc dodatkowy cap był zbędny.
+        let effective_strength = (self.correction_strength * style_weight).clamp(0.0, 1.0);
 
         (1.0 + (raw_ratio - 1.0) * effective_strength).clamp(0.5, 2.0)
     }
@@ -316,8 +313,6 @@ impl PitchCorrectionProcessor {
             let in_range = e.frequency_hz >= self.min_freq_hz && e.frequency_hz <= self.max_freq_hz;
             let reliable = e.voiced && in_range && e.confidence >= self.confidence_threshold;
 
-            // Confidence gate: nie pozwalamy, by niepewne ramki nadpisywaly tor F0,
-            // bo to powoduje jitter pitch-ratio i slyszalne artefakty modulacyjne.
             let chosen_pitch = if reliable {
                 self.unreliable_blocks = 0;
                 self.last_reliable_pitch_hz = e.frequency_hz;
@@ -335,9 +330,6 @@ impl PitchCorrectionProcessor {
                 if self.smoothed_pitch_hz <= 0.0 {
                     self.smoothed_pitch_hz = chosen_pitch;
                 } else {
-                    // Exponential smoothing (one-pole LP) stabilizuje F0 miedzy ramkami.
-                    // Bez tego drobny jitter detektora przeklada sie na ciagla modulacje
-                    // pitch-shift ratio, co slychac jako "buzz", "warble" i "boxy".
                     self.smoothed_pitch_hz = self.pitch_smoothing_coeff * self.smoothed_pitch_hz
                         + (1.0 - self.pitch_smoothing_coeff) * chosen_pitch;
                 }
