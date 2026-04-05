@@ -173,3 +173,5 @@ W hostach VST3/CLAP plugin udostepnia parametry:
 - Plugin wymaga builda z feature `plugin` oraz poprawnego zbundlowania artefaktu dla hosta (CLAP/VST3).
 - Tor audio oczekuje urzadzen I/O wspierajacych `f32` (to wymog bieżącej implementacji cpal).
 - Formant correction to podstawowa metoda; zaawansowane modele (cepstrum/LPC warstwowe) mozna dodac jako kolejny etap.
+
+[not working as expected]
